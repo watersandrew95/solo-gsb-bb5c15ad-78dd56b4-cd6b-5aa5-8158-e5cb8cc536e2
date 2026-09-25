@@ -137,6 +137,10 @@ docker compose down
 
 # 停止并删除数据库卷（清空所有账本数据）
 docker compose down -v
+
+# 在线备份账本（事务一致快照，见第 8 节）
+docker compose exec dp-ledger \
+  python -m app.backup --output /data/backups/ledger.db
 ```
 
 启动后：
@@ -1472,6 +1476,10 @@ EPSILON_TOLERANCE` 的子集为可行。在全部可行子集中按以下顺序�
   惰性清扫**：纯 SELECT 读取未冲正已授权申请与未到期预留后，在进程内穷举候选
   冲正子集并试算待申请项；与任何并发写互不阻塞，绝不改变数据库状态，每次调用
   都按实时账本重算。
+* 备份命令（`python -m app.backup`，见第 8 节）通过 SQLite **在线备份 API**
+  复制数据库：复制期间并发提交的写事务被安全地重拷，目标文件永远是事务一致
+  的快照，绝不包含半笔事务；备份只读源库，不进入写临界区，也不阻塞服务的
+  读写。
 
 ---
 
@@ -1495,7 +1503,65 @@ Schema 由 SQLite 的 `PRAGMA user_version` 管理，服务启动时自动顺序
 
 ---
 
-## 8. 运行测试
+## 8. 备份与恢复
+
+### 8.1 在线备份（容器内执行）
+
+服务运行期间即可在容器内执行备份命令，**无需停服**：
+
+```bash
+docker compose exec dp-ledger \
+  python -m app.backup --output /data/backups/ledger-$(date +%Y%m%dT%H%M%S).db
+```
+
+* 数据源为当前 `DATABASE_PATH`（容器内默认 `/data/ledger.db`）；快照通过
+  SQLite **在线备份 API** 流式复制——服务同时提交申请、预留或上限转拨也
+  **不会复制出半笔事务**，目标文件始终是事务一致的快照；备份只读源库，
+  不进入写临界区，也不阻塞服务的读写；
+* 发布协议：先写入**同目录临时文件** → 对副本执行
+  `PRAGMA integrity_check` 校验 → fsync 落盘 → 以**原子硬链接重命名**
+  发布到 PATH；任一步失败都会清除临时文件，且 **PATH 上已有备份绝不
+  被覆盖**（`os.link` 在目标已存在时原子失败，不存在检查与改名之间的
+  竞态窗口）；
+* PATH 必须尚不存在（防覆盖）；请把 PATH 放在持久卷 `/data` 下（如
+  `/data/backups/`，目录不存在会自动创建），否则容器重建后备份随之
+  丢失——命令检测到 PATH 不在数据库所在目录树下时会打印警告（不阻断）；
+* 成功时退出码 `0`，stdout 打印备份路径与字节数；失败时退出码非 `0`，
+  stderr 给出明确原因（源库缺失、目标已存在、完整性校验失败、目录不可
+  写等）。
+
+本地（无 Docker）运行同样可用：
+
+```bash
+export DATABASE_PATH=./ledger.db
+python -m app.backup --output ./backups/ledger.db
+```
+
+### 8.2 恢复
+
+备份文件是一个普通的事务一致 SQLite 数据库，恢复即「停服 → 放回
+`DATABASE_PATH` → 重启」：
+
+```bash
+# 1. 停止服务（写操作停止，避免新旧数据混杂）
+docker compose stop dp-ledger
+
+# 2. 用备份覆盖数据库文件（同时清掉可能残留的 WAL/SHM 边车文件）
+docker compose run --rm --no-deps dp-ledger sh -c \
+  'cp /data/backups/ledger-20260925T120000.db /data/ledger.db && \
+   rm -f /data/ledger.db-wal /data/ledger.db-shm'
+
+# 3. 重启服务（启动时自动完成 WAL 恢复与 schema 迁移）
+docker compose up -d dp-ledger
+```
+
+恢复后建议先访问 `GET /health` 与 `GET /datasets/{dataset_id}/budget`
+核对账本内容。备份文件离线也可用
+`sqlite3 /data/backups/xxx.db 'PRAGMA integrity_check;'` 校验。
+
+---
+
+## 9. 运行测试
 
 ```bash
 pip install -r requirements-dev.txt
@@ -1615,15 +1681,23 @@ request_not_granted、已冲正 409 request_already_reversed、按请求顺序�
 不合法候选、空 / 13 个 / 重复 / 空 ID / 超长 ID 422、`item` 缺失或
 epsilon/delta 越界 422。
 
+备份命令测试另覆盖：快照内容与源库一致（表、行、`user_version`、完整性校验）、
+写事务未提交的部分不进快照而提交后可见、持锁写事务期间备份照常成功、并发成对
+提交（数据集 + 申请同一事务）下快照始终满足跨表计数一致、目标已存在时拒绝覆盖
+且原文件字节不变（含发布阶段 `os.link` 原子防覆盖）、源库缺失与目标为目录的
+明确报错、校验失败时临时文件清除且不产生输出、输出目录自动创建、退出码与
+stderr 原因、`python -m app.backup` 子进程端到端调用（含重复运行拒绝覆盖）。
+
 ---
 
-## 9. 项目结构
+## 10. 项目结构
 
 ```
 .
 ├── app/
 │   ├── __init__.py
 │   ├── config.py      # 环境变量配置
+│   ├── backup.py      # python -m app.backup 在线备份命令
 │   ├── rdp.py         # Rényi DP orders、组合与 (ε,δ) 转换
 │   ├── schemas.py     # Pydantic 请求/响应模型
 │   ├── db.py          # SQLite 连接、schema、数据访问
