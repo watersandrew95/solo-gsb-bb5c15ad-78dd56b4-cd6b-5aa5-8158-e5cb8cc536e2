@@ -139,6 +139,14 @@ docker compose down
 docker compose down -v
 ```
 
+在容器运行期间做一份一致的数据库备份（备份文件同样落在持久化卷 `/data`，
+见 [第 9 节「备份与恢复」](#9-备份与恢复)）：
+
+```bash
+docker compose exec dp-ledger \
+  python -m app.backup --output /data/backups/ledger-$(date +%Y%m%d-%H%M%S).db
+```
+
 启动后：
 
 | 项目 | 地址 |
@@ -1502,6 +1510,16 @@ pip install -r requirements-dev.txt
 PYTHONPATH=. pytest -q
 ```
 
+备份相关测试覆盖：备份包含最新已提交快照且通过 `integrity_check` /
+`foreign_key_check`、成品为自包含单文件（无 `-wal` / `-shm` 旁车、
+rollback-journal 模式、权限 `0644`）、父目录自动创建、目标已存在绝不覆盖、
+源库不存在 / 为空 / 非 SQLite 文件 / 输出等于源库等失败均返回非零退出码且
+不留临时文件、校验失败时临时文件被清除且不发布、备份可恢复为可继续读写的
+数据库、CLI（`python -m app.backup`）成功返回 0 / 各类失败返回非零并给出
+明确原因，以及在后台线程连续提交事务时多次备份，每份快照的配对写入计数
+始终一致（不可能出现半笔事务）。
+
+
 测试覆盖：登记/重复登记、授予/拒绝、拒绝不留痕、纯 ε-DP 精确可加、
 RDP 数学性质、幂等回放（含拒绝回放）、`request_id` 冲突 409、缺失
 数据集 404，以及 60 路并发申请不超预算、20 路重复 `request_id` 并发仅
@@ -1617,7 +1635,113 @@ epsilon/delta 越界 422。
 
 ---
 
-## 9. 项目结构
+## 9. 备份与恢复
+
+账本提供容器内可执行的在线备份命令，使用 SQLite **在线备份 API**
+（`sqlite3.Connection.backup`）对当前 `DATABASE_PATH` 取一份**事务一致**的
+快照；服务同时提交申请、预留、批次或 epsilon 转拨也不会复制出「半笔事务」
+——在线备份 API 分批复制页面，源库在复制过程中提交事务时备份会从头重来，
+成品文件必然是某一个已提交时刻的完整快照（每笔事务要么完整在备份内，要么
+完全不在）。备份过程对源库以**只读**方式打开，不改变线上数据库。
+
+### 9.1 在线备份
+
+在**容器运行期间**直接执行（无需停服）：
+
+```bash
+docker compose exec dp-ledger \
+  python -m app.backup --output /data/backups/ledger-$(date +%Y%m%d-%H%M%S).db
+```
+
+* `--output PATH` 必填，为要创建的备份文件路径；命令读取的是当前环境的
+  `DATABASE_PATH`（容器内即 `/data/ledger.db`）；
+* **目标必须放在 `/data` 下**（命名卷 `dp-ledger-data`，容器内
+  `/data/ledger.db` 同一持久卷），容器重建后备份仍然存在；父目录不存在时
+  会自动创建；
+* 快照先写入同目录下的隐藏临时文件（`.ledger-*.backup-tmp`），对其执行
+  **`PRAGMA integrity_check`** 与 `PRAGMA foreign_key_check`，校验通过后才
+  **原子发布**到目标路径（硬链接入位 + 目录 fsync）；任何失败都会清除临时
+  文件；
+* **绝不覆盖已有备份**：目标路径已存在（或与并发备份撞路径）时命令直接
+  失败并给出明确原因，因此可以安全地反复执行（每次用不同文件名即可，例如
+  文件名带时间戳）；
+* 成功退出码为 `0` 并打印写入路径；失败（源库不存在 / 不是 SQLite 文件 /
+  目标已存在 / 校验未通过 / 无法写入等）一律以**非零退出码**返回，并向
+  stderr 打印明确原因；
+* 备份成品是自包含的单一数据库文件（发布前切换为 rollback-journal 模式，
+  不依赖 `-wal` / `-shm` 旁车文件；服务在其上启动时会自动切回 WAL），
+  文件权限 `0644`。
+
+本地（无 Docker）运行时同理，只需把 `--output` 指向 `DATABASE_PATH` 之外
+的位置：
+
+```bash
+export DATABASE_PATH=./ledger.db
+python -m app.backup --output ./backups/ledger-$(date +%Y%m%d-%H%M%S).db
+```
+
+### 9.2 从备份恢复
+
+恢复是**离线**操作：先停止服务，再用备份文件替换数据库文件，并清除可能
+残留的 WAL 旁车文件（避免旧 WAL 覆盖刚恢复的内容）。卷名默认为
+`<项目目录名>_dp-ledger-data`（可用 `docker volume ls` 确认）。
+
+**备份在卷内（9.1 的默认做法）**——用挂载同一命名卷的一次性容器直接拷贝：
+
+```bash
+# 1) 停服（保留数据卷）
+docker compose stop dp-ledger
+
+# 2) 用卷内备份覆盖线上数据库（把文件名换成实际的备份）
+docker run --rm -v "$(basename "$PWD")_dp-ledger-data":/data \
+  dp-budget-ledger:latest sh -c '
+    set -e
+    cp /data/backups/ledger-YYYYMMDD-HHMMSS.db /data/ledger.db
+    rm -f /data/ledger.db-wal /data/ledger.db-shm'
+
+# 3) 重新启动；服务启动时自动迁移（备份已是同一 schema 时为无操作）
+docker compose start dp-ledger
+
+# 4) 核对
+curl http://localhost:8000/datasets/<dataset_id>/budget
+```
+
+**备份在宿主机上（例如项目下 `backups/`）**——额外把宿主机目录挂为
+`/staging`，从 `/staging` 拷贝进卷：
+
+```bash
+docker compose stop dp-ledger
+docker run --rm \
+  -v "$(basename "$PWD")_dp-ledger-data":/data \
+  -v "$PWD/backups":/staging \
+  dp-budget-ledger:latest sh -c '
+    set -e
+    cp /staging/ledger-YYYYMMDD-HHMMSS.db /data/ledger.db
+    rm -f /data/ledger.db-wal /data/ledger.db-shm'
+docker compose start dp-ledger
+```
+
+本地（无 Docker）方式：
+
+```bash
+# 停止 uvicorn 后：
+cp ./backups/ledger-YYYYMMDD-HHMMSS.db ./ledger.db
+rm -f ./ledger.db-wal ./ledger.db-shm
+# 重新启动 uvicorn 即可
+```
+
+注意事项：
+
+* 恢复会**整库回退**到备份时刻：该时刻之后的申请、预留、批次、转拨与冲正
+  记录都会消失；恢复前建议先把当前库也另存一份；
+* 备份文件是自包含的单文件，`cp` 即可，**不要**把运行中库的
+  `-wal` / `-shm` 与备份文件混用；
+* 恢复后由服务启动流程负责把数据库切回 WAL 并应用必要的 schema 迁移，
+  无需手工干预。
+
+---
+
+## 10. 项目结构
 
 ```
 .
@@ -1628,8 +1752,9 @@ epsilon/delta 越界 422。
 │   ├── schemas.py     # Pydantic 请求/响应模型
 │   ├── db.py          # SQLite 连接、schema、数据访问
 │   ├── ledger.py      # 原子准入控制 + 幂等业务逻辑
+│   ├── backup.py      # 在线备份命令（python -m app.backup --output PATH）
 │   └── main.py        # FastAPI 路由与异常处理
-├── tests/             # pytest 端到端 + RDP 单元测试
+├── tests/             # pytest 端到端 + RDP 单元 + 备份一致性测试
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
